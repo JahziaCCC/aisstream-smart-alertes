@@ -3,7 +3,7 @@ name: AIS Smart Alerts
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"   # كل 10 دقائق
+- cron: "0 */6 * * *"
 
 jobs:
   run:
