@@ -1,0 +1,35 @@
+name: AIS Smart Alerts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"  # كل 10 دقائق
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run listener (short window)
+        env:
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_SECONDS: "360"       # 6 دقائق تشغيل داخل كل دورة
+          DEDUP_MINUTES: "30"      # منع تكرار التنبيه
+        run: |
+          python ais_smart_alerts.py
