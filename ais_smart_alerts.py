@@ -29,7 +29,6 @@ GULF    = [[22, 47], [31, 47], [31, 57], [22, 57]]
 
 BOUNDING_BOXES = [RED_SEA, GULF]
 
-
 # =========================
 # Helpers
 # =========================
@@ -106,7 +105,6 @@ def build_message(kind, mmsi, lat, lon, sog, cog=None, heading=None, region=""):
     ]
     return "\n".join([x for x in lines if x])
 
-
 # =========================
 # Smart rules (B)
 # =========================
@@ -147,12 +145,14 @@ def evaluate_and_alert(state, ship):
             mark_alert(state, str(mmsi), kind)
         return
 
-
 # =========================
 # WebSocket runner (graceful stop)
 # =========================
 def run():
     state = load_state()
+
+    # ✅ رسالة اختبار (تأكد إن Telegram شغال)
+    send_telegram("🟢 AIS Smart Monitor يعمل بنجاح")
 
     def on_open(ws):
         sub = {
@@ -207,7 +207,6 @@ def run():
     threading.Thread(target=stop_ws, daemon=True).start()
 
     ws.run_forever(ping_interval=20, ping_timeout=10)
-
 
 if __name__ == "__main__":
     run()
