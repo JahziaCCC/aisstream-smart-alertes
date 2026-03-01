@@ -1,14 +1,14 @@
-name: AIS Smart Alerts
+name: AIS + Maritime News Monitor
 
 on:
   workflow_dispatch:
   schedule:
-- cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"   # كل 6 ساعات (UTC)
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -24,14 +24,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run AIS Smart Monitor + Summary Report
+      # ===== 1) AIS Summary =====
+      - name: Run AIS Summary
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RUN_SECONDS: "240"          # 4 دقائق
+          RUN_SECONDS: "240"
           DEDUP_MINUTES: "30"
-          SEND_SUMMARY_REPORT: "1"    # ✅ يرسل تقرير ملخّص بنهاية التشغيل
-          REPORT_TOP_N: "12"          # عدد السفن في الملخص
+          SEND_SUMMARY_REPORT: "1"
+          REPORT_TOP_N: "12"
         run: |
           python ais_smart_alerts.py
+
+      # ===== 2) Maritime News =====
+      - name: Run Maritime News Monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEWS_HOURS: "6"
+          NEWS_TOP_N: "7"
+          NEWS_DEDUP_DAYS: "7"
+        run: |
+          python maritime_news_monitor.py
