@@ -1,213 +1,229 @@
 import os
-import re
 import json
 import time
 import hashlib
 import datetime as dt
-from urllib.parse import quote_plus
-
+import threading
 import requests
-import feedparser
-from bs4 import BeautifulSoup
+import websocket
 
+# =========================
+# ENV
+# =========================
+API_KEY = os.environ["AISSTREAM_API_KEY"]
 BOT = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT = os.environ["TELEGRAM_CHAT_ID"]
 
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "240"))
+DEDUP_MINUTES = int(os.getenv("DEDUP_MINUTES", "30"))
+SEND_SUMMARY_REPORT = os.getenv("SEND_SUMMARY_REPORT", "1") == "1"
+REPORT_TOP_N = int(os.getenv("REPORT_TOP_N", "12"))
+
+STATE_FILE = "state.json"
 KSA_TZ = dt.timezone(dt.timedelta(hours=3))
-STATE_FILE = "news_state.json"
 
-# ===== إعدادات التقرير =====
-MAX_ITEMS_PER_BUCKET = int(os.getenv("NEWS_TOP_N", "7"))     # كم خبر نعرض
-LOOKBACK_HOURS = int(os.getenv("NEWS_HOURS", "6"))           # كل كم ساعة نبحث
-DEDUP_DAYS = int(os.getenv("NEWS_DEDUP_DAYS", "7"))          # منع تكرار الخبر كم يوم
+# =========================
+# GEOFENCE
+# =========================
+RED_SEA = [[12, 32], [30, 32], [30, 44], [12, 44]]
+GULF = [[22, 47], [31, 47], [31, 57], [22, 57]]
 
-# ===== نطاقات الاهتمام =====
-# (أسلوب كلمات مفتاحية - تقدر توسعها لاحقاً)
-QUERIES = [
-    # Red Sea
-    ("البحر الأحمر", [
-        '("Red Sea" OR "Bab al-Mandab" OR "Gulf of Aden") (ship OR vessel OR tanker OR bulker OR container) (attack OR incident OR explosion OR fire OR collision OR grounding OR hijack OR piracy OR drone OR missile)',
-        'UKMTO "Red Sea" incident',
-    ]),
-    # Gulf / Hormuz
-    ("الخليج العربي", [
-        '("Strait of Hormuz" OR "Persian Gulf" OR "Arabian Gulf" OR "Gulf of Oman") (ship OR vessel OR tanker) (incident OR explosion OR attack OR collision OR fire OR grounding OR piracy)',
-        'UKMTO "Hormuz" incident',
-    ]),
-]
+BOUNDING_BOXES = [RED_SEA, GULF]
 
-# ===== روابط RSS (Google News Search) =====
-# صيغة Google News RSS search مع معاملات hl/gl/ceid موثّقة عملياً من Feedly/مراجع RSS  [oai_citation:2‡docs.feedly.com](https://docs.feedly.com/article/375-what-are-some-of-the-advanced-keyword-alerts-google-news-search-parameters?utm_source=chatgpt.com)
-def google_news_rss_url(query: str, hours: int) -> str:
-    # when:6h يساعد يجيب آخر 6 ساعات تقريباً
-    q = f"{query} when:{hours}h"
-    return f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-US&gl=US&ceid=US:en"
-
-# ===== UKMTO Recent Incidents =====
-# صفحة رسمية للحوادث الحديثة  [oai_citation:3‡UKMTO](https://www.ukmto.org/recent-incidents?utm_source=chatgpt.com)
-UKMTO_RECENT = "https://www.ukmto.org/recent-incidents"
-
-
+# =========================
+# HELPERS
+# =========================
 def now_ksa():
     return dt.datetime.now(tz=KSA_TZ)
 
+# 🔥 حل مشكلة Telegram 400 (تقسيم الرسائل)
 def send_telegram(text: str):
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT}/sendMessage",
-        data={"chat_id": CHAT, "text": text},
-        timeout=25
-    )
-    r.raise_for_status()
+    MAX_LEN = 3500
+    chunks = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)]
+
+    for part in chunks:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT}/sendMessage",
+            data={"chat_id": CHAT, "text": part},
+            timeout=25
+        )
+        try:
+            r.raise_for_status()
+        except:
+            pass
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"seen": {}}
+        return {"dedup": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return {"seen": {}}
+    except:
+        return {"dedup": {}}
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def prune_state(state):
-    # حذف القديم
-    cutoff = now_ksa() - dt.timedelta(days=DEDUP_DAYS)
-    seen = state.get("seen", {})
-    new_seen = {}
-    for k, iso in seen.items():
-        try:
-            ts = dt.datetime.fromisoformat(iso)
-        except Exception:
-            continue
-        if ts >= cutoff:
-            new_seen[k] = iso
-    state["seen"] = new_seen
+def dedup_key(mmsi, kind):
+    return hashlib.sha1(f"{mmsi}|{kind}".encode()).hexdigest()
 
-def key_for_item(title: str, link: str) -> str:
-    raw = f"{title.strip()}|{link.strip()}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+def should_alert(state, mmsi, kind):
+    k = dedup_key(mmsi, kind)
+    last = state["dedup"].get(k)
+    if not last:
+        return True
+    last_dt = dt.datetime.fromisoformat(last)
+    return (now_ksa() - last_dt) > dt.timedelta(minutes=DEDUP_MINUTES)
 
-def is_seen(state, k: str) -> bool:
-    return k in state.get("seen", {})
+def mark_alert(state, mmsi, kind):
+    state["dedup"][dedup_key(mmsi, kind)] = now_ksa().isoformat()
 
-def mark_seen(state, k: str):
-    state.setdefault("seen", {})[k] = now_ksa().isoformat()
-
-def clean_title(t: str) -> str:
-    return re.sub(r"\s+", " ", (t or "").strip())
-
-def fetch_google_news_items(bucket_name: str, queries: list[str]) -> list[dict]:
-    items = []
-    for q in queries:
-        url = google_news_rss_url(q, LOOKBACK_HOURS)
-        feed = feedparser.parse(url)
-        for e in getattr(feed, "entries", []):
-            title = clean_title(getattr(e, "title", ""))
-            link = getattr(e, "link", "")
-            published = clean_title(getattr(e, "published", "")) or clean_title(getattr(e, "updated", ""))
-            if not title or not link:
-                continue
-            items.append({
-                "bucket": bucket_name,
-                "source": "Google News (Media)",
-                "title": title,
-                "link": link,
-                "published": published
-            })
-    return items
-
-def fetch_ukmto_recent() -> list[dict]:
-    items = []
+def guess_region(lat, lon):
     try:
-        html = requests.get(UKMTO_RECENT, timeout=25).text
-        soup = BeautifulSoup(html, "lxml")
+        lat = float(lat); lon = float(lon)
+    except:
+        return ""
+    if 12 <= lat <= 30 and 32 <= lon <= 44:
+        return "البحر الأحمر"
+    if 22 <= lat <= 31 and 47 <= lon <= 57:
+        return "الخليج العربي"
+    return ""
 
-        # نحاول التقاط روابط الحوادث من الصفحة
-        # (هيكل الصفحة قد يتغير، فنجمع بشكل مرن)
-        for a in soup.select("a"):
-            txt = clean_title(a.get_text(" "))
-            href = a.get("href", "")
-            if not href:
-                continue
-            if "incident" in href.lower() or "incidents" in href.lower():
-                if not txt or len(txt) < 12:
-                    continue
-                link = href if href.startswith("http") else f"https://www.ukmto.org{href}"
-                items.append({
-                    "bucket": "UKMTO",
-                    "source": "UKMTO (Official)",
-                    "title": txt,
-                    "link": link,
-                    "published": ""
-                })
-    except Exception:
-        pass
-    # إزالة تكرارات بسيطة
-    uniq = {}
-    for it in items:
-        k = key_for_item(it["title"], it["link"])
-        uniq[k] = it
-    return list(uniq.values())
-
-def build_report(new_items: list[dict]) -> str:
+def build_alert(kind, mmsi, lat, lon, sog, region):
     t = now_ksa().strftime("%Y-%m-%d %H:%M KSA")
+    return f"""🚢 تنبيه بحري ذكي
+🕒 {t}
+📍 {lat},{lon}
+🆔 MMSI: {mmsi}
+🏷️ المنطقة: {region}
+⚓ السرعة: {sog} knots
+⚠️ السبب: {kind}
+"""
+
+# =========================
+# SMART RULES
+# =========================
+def evaluate_and_alert(state, ship):
+    mmsi = ship.get("UserID")
+    lat = ship.get("Latitude")
+    lon = ship.get("Longitude")
+    sog = ship.get("Sog")
+
+    if not mmsi or lat is None or lon is None or sog is None:
+        return
+
+    try:
+        sog = float(sog)
+    except:
+        return
+
+    region = guess_region(lat, lon)
+
+    if sog == 0:
+        kind = "توقف كامل"
+    elif sog < 1:
+        kind = "سرعة منخفضة جداً"
+    else:
+        return
+
+    if should_alert(state, str(mmsi), kind):
+        send_telegram(build_alert(kind, mmsi, lat, lon, sog, region))
+        mark_alert(state, str(mmsi), kind)
+
+# =========================
+# REPORT
+# =========================
+def build_summary(stats, vessels):
+    t = now_ksa().strftime("%Y-%m-%d %H:%M KSA")
+
     lines = [
-        "📰 تقرير الحوادث البحرية (إعلامي + رسمي)",
+        "📡 تقرير حركة السفن (AIS)",
         f"🕒 {t}",
-        f"⏱️ نافذة الرصد: آخر {LOOKBACK_HOURS} ساعات",
         "════════════════════",
+        f"📨 الرسائل: {stats['messages']}",
+        f"🚢 سفن فريدة: {len(vessels)}",
+        "════════════════════"
     ]
 
-    if not new_items:
-        lines.append("✅ لا توجد أخبار/حوادث جديدة مطابقة للنطاق خلال النافذة الحالية.")
+    top = list(vessels.values())[:REPORT_TOP_N]
+
+    if not top:
+        lines.append("لا توجد بيانات سفن خلال فترة التشغيل.")
         return "\n".join(lines)
 
-    # تصنيف حسب Bucket
-    by_bucket = {}
-    for it in new_items:
-        by_bucket.setdefault(it["bucket"], []).append(it)
+    for i, v in enumerate(top, 1):
+        lines.append(
+            f"{i}️⃣ MMSI {v['mmsi']} | {v['region']} | "
+            f"{v['lat']},{v['lon']} | SOG {v['sog']}"
+        )
 
-    # ترتيب بسيط (كما وصلت)
-    for bucket, items in by_bucket.items():
-        lines.append(f"📌 {bucket}")
-        for i, it in enumerate(items[:MAX_ITEMS_PER_BUCKET], 1):
-            pub = f" | {it['published']}" if it.get("published") else ""
-            # نطبع العنوان ثم الرابط في سطر مستقل (أوضح بالتيليجرام)
-            lines.append(f"{i}️⃣ {it['title']} ({it['source']}{pub})")
-            lines.append(f"🔗 {it['link']}")
-        lines.append("════════════════════")
+    return "\n".join(lines)
 
-    return "\n".join(lines).strip()
-
-def main():
+# =========================
+# RUNNER
+# =========================
+def run():
     state = load_state()
-    prune_state(state)
 
-    # نجمع عناصر من UKMTO + Google News
-    all_items = []
-    all_items.extend(fetch_ukmto_recent())
+    stats = {"messages": 0}
+    vessels = {}
 
-    for bucket_name, queries in QUERIES:
-        all_items.extend(fetch_google_news_items(bucket_name, queries))
+    def on_open(ws):
+        ws.send(json.dumps({
+            "APIKey": API_KEY,
+            "BoundingBoxes": BOUNDING_BOXES
+        }))
 
-    # Dedup + فلترة جديد فقط
-    new_items = []
-    for it in all_items:
-        k = key_for_item(it["title"], it["link"])
-        if is_seen(state, k):
-            continue
-        # نعتبره جديد
-        new_items.append(it)
-        mark_seen(state, k)
+    def on_message(ws, message):
+        stats["messages"] += 1
 
-    # بناء التقرير وإرساله
-    report = build_report(new_items)
-    send_telegram(report)
+        try:
+            data = json.loads(message)
+        except:
+            return
 
-    save_state(state)
+        msg = data.get("Message", {})
+        ship = msg.get("PositionReport") or msg.get("StandardClassBPositionReport")
+
+        if not ship:
+            return
+
+        mmsi = ship.get("UserID")
+        lat = ship.get("Latitude")
+        lon = ship.get("Longitude")
+        sog = ship.get("Sog")
+
+        if mmsi and lat and lon:
+            vessels[str(mmsi)] = {
+                "mmsi": mmsi,
+                "lat": lat,
+                "lon": lon,
+                "sog": sog,
+                "region": guess_region(lat, lon)
+            }
+
+        evaluate_and_alert(state, ship)
+
+    def on_close(ws, code, reason):
+        save_state(state)
+
+    ws = websocket.WebSocketApp(
+        "wss://stream.aisstream.io/v0/stream",
+        on_open=on_open,
+        on_message=on_message,
+        on_close=on_close
+    )
+
+    def stop():
+        time.sleep(RUN_SECONDS)
+        ws.close()
+
+    threading.Thread(target=stop, daemon=True).start()
+    ws.run_forever()
+
+    if SEND_SUMMARY_REPORT:
+        send_telegram(build_summary(stats, vessels))
 
 if __name__ == "__main__":
-    main()
+    run()
