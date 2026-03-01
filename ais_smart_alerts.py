@@ -19,23 +19,23 @@ DEDUP_MINUTES = int(os.getenv("DEDUP_MINUTES", "30"))
 SEND_SUMMARY_REPORT = os.getenv("SEND_SUMMARY_REPORT", "1") == "1"
 REPORT_TOP_N = int(os.getenv("REPORT_TOP_N", "12"))
 
-# تحسينات D
-REPORT_SPEED_MAX = float(os.getenv("REPORT_SPEED_MAX", "35"))     # فلتر عرض top list (A)
-ALERT_SLOW_KN = float(os.getenv("ALERT_SLOW_KN", "1"))            # عتبة التنبيه البطيء
-CLUSTER_DECIMALS = int(os.getenv("CLUSTER_DECIMALS", "3"))        # تقريب الاحداثيات للكثافة (C)
+# D = A+B+C
+REPORT_SPEED_MAX = float(os.getenv("REPORT_SPEED_MAX", "35"))   # A: فلتر عرض Top list
+ALERT_SLOW_KN = float(os.getenv("ALERT_SLOW_KN", "1"))          # عتبة تنبيه البطء
+CLUSTER_DECIMALS = int(os.getenv("CLUSTER_DECIMALS", "3"))      # C: تقريب الاحداثيات للكثافة
 
 STATE_FILE = "state.json"
 KSA_TZ = dt.timezone(dt.timedelta(hours=3))
 
 # =========================
 # ✅ AISSTREAM BoundingBoxes FORMAT (Two corners)
+# Each bbox: [[lat1, lon1], [lat2, lon2]]
 # =========================
 RED_SEA_BBOX = [[12, 32], [30, 44]]
-GULF_BBOX    = [[22, 47], [31, 57]]
+GULF_BBOX = [[22, 47], [31, 57]]
 BOUNDING_BOXES = [RED_SEA_BBOX, GULF_BBOX]
 
 FILTER_MESSAGE_TYPES = ["PositionReport", "StandardClassBPositionReport"]
-
 
 # =========================
 # HELPERS
@@ -49,8 +49,14 @@ def fmt(x, nd=4):
     except Exception:
         return str(x)
 
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
 def send_telegram(text: str):
-    # Telegram max ~4096 chars. Split safely.
+    # Telegram max ~4096 chars; split safely
     MAX_LEN = 3500
     chunks = [text[i:i + MAX_LEN] for i in range(0, len(text), MAX_LEN)]
     for part in chunks:
@@ -111,20 +117,13 @@ def build_alert(kind, mmsi, lat, lon, sog, region):
         f"📍 الموقع: {fmt(lat)},{fmt(lon)}\n"
         f"🆔 MMSI: {mmsi}\n"
         f"🏷️ المنطقة: {region}\n"
-        f"⚓ السرعة: {fmt(sog,1)} knots\n"
+        f"⚓ السرعة: {fmt(sog, 1)} knots\n"
         f"⚠️ السبب: {kind}\n"
         "✅ التوصية: يحتاج متابعة"
     )
 
-def safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
 # =========================
-# SMART RULES (B alerts)
+# SMART ALERTS (B)
 # =========================
 def evaluate_and_alert(state, ship):
     mmsi = ship.get("UserID") or ship.get("Mmsi") or ship.get("MMSI") or ship.get("mmsi")
@@ -141,7 +140,6 @@ def evaluate_and_alert(state, ship):
 
     region = guess_region(lat, lon)
 
-    # توقف كامل
     if sog_f == 0.0:
         kind = "توقف كامل داخل النطاق"
         if should_alert(state, str(mmsi), kind):
@@ -149,7 +147,6 @@ def evaluate_and_alert(state, ship):
             mark_alert(state, str(mmsi), kind)
         return
 
-    # بطيء جدًا (قابل للتعديل)
     if sog_f < ALERT_SLOW_KN:
         kind = "سرعة منخفضة جداً (Loitering/Drifting)"
         if should_alert(state, str(mmsi), kind):
@@ -157,12 +154,10 @@ def evaluate_and_alert(state, ship):
             mark_alert(state, str(mmsi), kind)
         return
 
-
 # =========================
-# REPORT HELPERS (A + B + C)
+# REPORT (A+B+C)
 # =========================
 def speed_bucket(sog_f):
-    # B: توزيع سرعات تنفيذي
     if sog_f is None:
         return "unknown"
     if sog_f == 0:
@@ -182,8 +177,8 @@ def bucket_label(key):
         "stopped": "🟥 متوقفة (0 kn)",
         "very_slow": "🟧 بطيئة (0–1 kn)",
         "medium": "🟨 متوسطة (1–15 kn)",
-        "fast_ok": "🟩 سريعة (15–{:.0f} kn)".format(REPORT_SPEED_MAX),
-        "anomaly": "⚫ شاذة (>{:.0f} kn)".format(REPORT_SPEED_MAX),
+        "fast_ok": f"🟩 سريعة (15–{REPORT_SPEED_MAX:.0f} kn)",
+        "anomaly": f"⚫ شاذة (>{REPORT_SPEED_MAX:.0f} kn)",
         "unknown": "⚪ غير مكتمل"
     }.get(key, key)
 
@@ -195,7 +190,6 @@ def cluster_key(lat, lon):
 
 def build_summary(run_stats, vessels):
     t = now_ksa().strftime("%Y-%m-%d %H:%M KSA")
-
     total_msgs = run_stats["messages"]
     total_pos = run_stats["pos_reports"]
     unique = len(vessels)
@@ -203,13 +197,13 @@ def build_summary(run_stats, vessels):
     red_count = sum(1 for v in vessels.values() if v.get("region") == "البحر الأحمر")
     gulf_count = sum(1 for v in vessels.values() if v.get("region") == "الخليج العربي")
 
-    # B: توزيع السرعات
+    # B: speed distribution
     buckets = {"stopped": 0, "very_slow": 0, "medium": 0, "fast_ok": 0, "anomaly": 0, "unknown": 0}
     for v in vessels.values():
         buckets[speed_bucket(v.get("sog_f"))] += 1
 
-    # C: كشف نقاط كثافة (تجمع نفس الإحداثية تقريباً)
-    clusters = {}  # (latR, lonR) -> {count, avg_sog, region}
+    # C: clusters
+    clusters = {}
     for v in vessels.values():
         ck = cluster_key(v.get("lat"), v.get("lon"))
         if not ck:
@@ -222,12 +216,11 @@ def build_summary(run_stats, vessels):
         if not c.get("region") and v.get("region"):
             c["region"] = v["region"]
 
-    # أكبر 3 تجمعات
     top_clusters = sorted(clusters.items(), key=lambda kv: kv[1]["count"], reverse=True)[:3]
 
-    # A: Top list نظيف (فلتر السرعات الشاذة) + ترتيب
+    # A: clean top list (filter SOG <= REPORT_SPEED_MAX)
     rows = list(vessels.values())
-    rows.sort(key=lambda x: (x.get("last_ts", 0)), reverse=True)
+    rows.sort(key=lambda x: x.get("last_ts", 0), reverse=True)
 
     clean_rows = [r for r in rows if (r.get("sog_f") is not None and r["sog_f"] <= REPORT_SPEED_MAX)]
     clean_top = clean_rows[:REPORT_TOP_N]
@@ -260,7 +253,10 @@ def build_summary(run_stats, vessels):
             avg_txt = f"{fmt(avg,1)} kn" if avg is not None else "غير متاح"
             region = meta.get("region", "")
             reg_txt = f" | {region}" if region else ""
-            lines.append(f"{i}️⃣ {fmt(latR,CLUSTER_DECIMALS)},{fmt(lonR,CLUSTER_DECIMALS)}{reg_txt} — {meta['count']} سفن | متوسط السرعة: {avg_txt}")
+            lines.append(
+                f"{i}️⃣ {fmt(latR, CLUSTER_DECIMALS)},{fmt(lonR, CLUSTER_DECIMALS)}{reg_txt} — "
+                f"{meta['count']} سفن | متوسط السرعة: {avg_txt}"
+            )
 
     lines.append("════════════════════")
     lines.append(f"🔎 أعلى {len(clean_top)} سفن (فلتر عرض ≤ {REPORT_SPEED_MAX:.0f} kn)")
@@ -274,21 +270,19 @@ def build_summary(run_stats, vessels):
     else:
         for i, v in enumerate(clean_top, 1):
             lines.append(
-                f"{i}️⃣ MMSI {v['mmsi']} | {v.get('region','')} | "
-                f"{fmt(v.get('lat'))},{fmt(v.get('lon'))} | SOG {fmt(v.get('sog_f'),1)} kn"
+                f"{i}️⃣ MMSI {v['mmsi']} | {v.get('region','')}\n"
+                f"   📍 {fmt(v.get('lat'))},{fmt(v.get('lon'))} | SOG {fmt(v.get('sog_f'),1)} kn"
             )
 
     return "\n".join(lines)
-
 
 # =========================
 # RUNNER
 # =========================
 def run():
     state = load_state()
-
     run_stats = {"messages": 0, "pos_reports": 0}
-    vessels = {}  # mmsi -> last snapshot
+    vessels = {}
 
     def on_open(ws):
         sub = {
@@ -337,7 +331,6 @@ def run():
                 "last_ts": time.time()
             }
 
-        # تنبيهات B
         evaluate_and_alert(state, ship)
 
     def on_error(ws, error):
@@ -369,7 +362,6 @@ def run():
 
     if SEND_SUMMARY_REPORT:
         send_telegram(build_summary(run_stats, vessels))
-
 
 if __name__ == "__main__":
     run()
