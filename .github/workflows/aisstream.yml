@@ -1,29 +1,40 @@
-name: AIS + Maritime Monitor
+name: AIS Monitor (6-hour Summary)
 
 on:
   workflow_dispatch:
   schedule:
-  - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"   # كل 6 ساعات (UTC)
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: |
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run AIS
+      - name: Run AIS Smart Monitor
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RUN_SECONDS: "60"
+          RUN_SECONDS: "240"
+          DEDUP_MINUTES: "30"
           SEND_SUMMARY_REPORT: "1"
+          REPORT_TOP_N: "12"
+          REPORT_SPEED_MAX: "35"
+          ALERT_SLOW_KN: "1"
+          CLUSTER_DECIMALS: "3"
         run: |
           python ais_smart_alerts.py
