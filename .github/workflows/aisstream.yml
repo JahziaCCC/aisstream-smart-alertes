@@ -24,12 +24,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run AIS Smart Listener
+      - name: Run AIS Smart Monitor + Summary Report
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RUN_SECONDS: "240"      # 4 دقائق
-          DEDUP_MINUTES: "30"     # منع تكرار نفس التنبيه
+          RUN_SECONDS: "240"          # 4 دقائق
+          DEDUP_MINUTES: "30"
+          SEND_SUMMARY_REPORT: "1"    # ✅ يرسل تقرير ملخّص بنهاية التشغيل
+          REPORT_TOP_N: "12"          # عدد السفن في الملخص
         run: |
           python ais_smart_alerts.py
