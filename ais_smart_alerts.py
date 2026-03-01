@@ -1,9 +1,9 @@
 import os
 import json
 import time
-import math
 import hashlib
 import datetime as dt
+import threading
 import requests
 import websocket
 
@@ -14,16 +14,11 @@ API_KEY = os.environ["AISSTREAM_API_KEY"]
 BOT = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT = os.environ["TELEGRAM_CHAT_ID"]
 
-# تشغيل محدود (مهم لـ GitHub Actions)
-RUN_SECONDS = int(os.getenv("RUN_SECONDS", "360"))  # 6 دقائق افتراضياً
-
-# منع تكرار التنبيه لنفس السفينة خلال X دقائق
-DEDUP_MINUTES = int(os.getenv("DEDUP_MINUTES", "30"))
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "240"))     # 4 دقائق افتراضياً
+DEDUP_MINUTES = int(os.getenv("DEDUP_MINUTES", "30"))  # منع تكرار التنبيه
 
 STATE_FILE = "state.json"
-
 KSA_TZ = dt.timezone(dt.timedelta(hours=3))
-
 
 # =========================
 # GEOFENCE (Bounding Boxes)
@@ -84,24 +79,16 @@ def fmt(x, nd=4):
     except Exception:
         return str(x)
 
-def safe_get(d, *keys):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return None
-        cur = cur[k]
-    return cur
-
-
-# =========================
-# Smart rules (B)
-# =========================
-# نرسل تنبيه عند:
-# 1) سرعة منخفضة جداً (Loitering/Drifting) SOG < 1
-# 2) توقف فعلي SOG == 0 (أكثر حساسية)
-# 3) تغير سرعة مفاجئ (اختياري بسيط)
-# ملاحظة: AISstream قد يرسل أنواع رسائل مختلفة - احنا نركز على PositionReport
-# =========================
+def guess_region(lat, lon):
+    try:
+        lat = float(lat); lon = float(lon)
+    except Exception:
+        return ""
+    if 12 <= lat <= 30 and 32 <= lon <= 44:
+        return "البحر الأحمر"
+    if 22 <= lat <= 31 and 47 <= lon <= 57:
+        return "الخليج العربي"
+    return ""
 
 def build_message(kind, mmsi, lat, lon, sog, cog=None, heading=None, region=""):
     t = now_ksa().strftime("%Y-%m-%d %H:%M KSA")
@@ -119,18 +106,10 @@ def build_message(kind, mmsi, lat, lon, sog, cog=None, heading=None, region=""):
     ]
     return "\n".join([x for x in lines if x])
 
-def guess_region(lat, lon):
-    # تخمين خفيف فقط للعرض
-    try:
-        lat = float(lat); lon = float(lon)
-    except Exception:
-        return ""
-    if 12 <= lat <= 30 and 32 <= lon <= 44:
-        return "البحر الأحمر"
-    if 22 <= lat <= 31 and 47 <= lon <= 57:
-        return "الخليج العربي"
-    return ""
 
+# =========================
+# Smart rules (B)
+# =========================
 def evaluate_and_alert(state, ship):
     mmsi = ship.get("UserID") or ship.get("Mmsi") or ship.get("MMSI") or ship.get("mmsi")
     if not mmsi:
@@ -150,7 +129,6 @@ def evaluate_and_alert(state, ship):
 
     cog = ship.get("Cog")
     heading = ship.get("TrueHeading")
-
     region = guess_region(lat, lon)
 
     # Rule 1: توقف كامل
@@ -171,13 +149,10 @@ def evaluate_and_alert(state, ship):
 
 
 # =========================
-# WebSocket
+# WebSocket runner (graceful stop)
 # =========================
 def run():
     state = load_state()
-
-    start = time.time()
-    stop_at = start + RUN_SECONDS
 
     def on_open(ws):
         sub = {
@@ -187,11 +162,6 @@ def run():
         ws.send(json.dumps(sub))
 
     def on_message(ws, message):
-        # وقف بعد مدة محددة (مهم لـ Actions)
-        if time.time() >= stop_at:
-            ws.close()
-            return
-
         try:
             data = json.loads(message)
         except Exception:
@@ -201,20 +171,18 @@ def run():
         if not isinstance(msg, dict):
             return
 
-        # PositionReport
         pr = msg.get("PositionReport")
         if isinstance(pr, dict):
             evaluate_and_alert(state, pr)
             return
 
-        # بعض الرسائل قد تكون "StandardClassBPositionReport"
         prb = msg.get("StandardClassBPositionReport")
         if isinstance(prb, dict):
             evaluate_and_alert(state, prb)
             return
 
     def on_error(ws, error):
-        # لا نفجر التشغيل بسبب خطأ واحد
+        # تجاهل الأخطاء العابرة
         pass
 
     def on_close(ws, code, reason):
@@ -228,7 +196,16 @@ def run():
         on_close=on_close
     )
 
-    # ping للحفاظ على الاتصال
+    # قاتل نظيف: يقفل الاتصال بعد RUN_SECONDS عشان يطلع Success
+    def stop_ws():
+        time.sleep(RUN_SECONDS)
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=stop_ws, daemon=True).start()
+
     ws.run_forever(ping_interval=20, ping_timeout=10)
 
 
